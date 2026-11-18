@@ -1,0 +1,15 @@
+cookies.txt
+push_to_github.bat
+*.exe
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+ytdl_debug.log
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.opus
