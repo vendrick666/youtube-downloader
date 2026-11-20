@@ -61,6 +61,14 @@ QUALITIES = {
 }
 DEFAULT_QUALITY = "1"
 
+# Фрагменты вырезает FFmpeg: просим его сообщать прогресс и ошибки, а точную обрезку
+# (перекодирование) делать быстрым пресетом - иначе 4K/AV1-фрагмент кодируется очень долго.
+FFMPEG_REPORT_ARGS = "-loglevel error -progress pipe:2 -nostats"
+FFMPEG_FAST_ENCODE = "-preset veryfast -crf 18 -b:v 0 -pix_fmt yuv420p"
+FFMPEG_PROGRESS_LINE = re.compile(
+    r"^(?:out_time(?:_us|_ms)?|speed|progress|frame|fps|bitrate|total_size"
+    r"|dup_frames|drop_frames|stream_\d+_\d+_q)=")
+
 
 # ---------------------------------------------------------------- helpers
 
@@ -127,28 +135,30 @@ def ensure_ytdlp():
     return True
 
 
-def find_deno():
-    path = py_output("import deno; print(deno.find_deno_bin())")
-    if path and Path(path).is_file():
-        return path
-    path = shutil.which("deno")
-    if path:
-        return path
-    for name in ("deno.exe", "deno"):
-        candidate = Path.home() / ".spotdl" / name
+def gui_tool(name):
+    """FFmpeg/Deno, которые скачала себе программа с окном (YouTube Downloader.exe)."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    for filename in (f"{name}.exe", name):
+        candidate = Path(base) / "YTDownloader" / "bin" / filename
         if candidate.is_file():
             return str(candidate)
     return None
 
 
+def find_deno():
+    path = py_output("import deno; print(deno.find_deno_bin())")
+    if path and Path(path).is_file():
+        return path
+    return gui_tool("deno") or shutil.which("deno")
+
+
 def find_ffmpeg():
-    path = shutil.which("ffmpeg")
+    # полная сборка FFmpeg от авторов yt-dlp, если её уже скачала программа с окном
+    path = gui_tool("ffmpeg") or shutil.which("ffmpeg")
     if path:
         return path
-    for name in ("ffmpeg.exe", "ffmpeg"):  # FFmpeg, который скачал spotDL
-        candidate = Path.home() / ".spotdl" / name
-        if candidate.is_file():
-            return str(candidate)
     code = "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
     path = py_output(code)
     if not path:
@@ -280,17 +290,37 @@ def media_snapshot(folder):
     return result
 
 
-def run_ytdlp(args):
-    """Прогресс идёт прямо в консоль, а сообщения об ошибках мы ещё и запоминаем."""
+def run_ytdlp(args, section=None):
+    """Прогресс идёт прямо в консоль, а сообщения об ошибках мы ещё и запоминаем.
+    При вырезании фрагмента прогресс присылает FFmpeg - показываем его одной строкой."""
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     proc = subprocess.Popen([sys.executable, "-m", "yt_dlp", *args],
                             stderr=subprocess.PIPE, env=env)
+    total = section[1] - section[0] if section and section[1] is not None else None
     lines = []
+    progress_shown = False
     for raw in proc.stderr:
         line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if FFMPEG_PROGRESS_LINE.match(line):
+            if line.startswith("out_time_us="):
+                try:
+                    done = max(int(line.split("=", 1)[1]) / 1_000_000, 0)
+                except ValueError:
+                    continue
+                text = f"Вырезаю фрагмент: {format_timecode(done)}"
+                if total:
+                    text += f" из {format_timecode(total)} ({min(done / total, 1):.0%})"
+                print("\r" + text.ljust(60), end="", flush=True)
+                progress_shown = True
+            continue
+        if progress_shown:
+            print()
+            progress_shown = False
         lines.append(line)
         print(line, flush=True)
+    if progress_shown:
+        print()
     proc.wait()
     return proc.returncode, lines
 
@@ -305,8 +335,11 @@ def build_args(url, folder, quality, whole_playlist, ffmpeg, deno, section=None)
         suffix = f" {file_label(start)}-{file_label(end) if end is not None else 'конец'}"
         template = template[:-len(".%(ext)s")] + suffix + ".%(ext)s"
         end_arg = seconds_arg(end) if end is not None else "inf"
+        ffmpeg_args = FFMPEG_REPORT_ARGS
+        if "-x" not in QUALITIES[quality][1]:  # видео, а не "только звук"
+            ffmpeg_args += " " + FFMPEG_FAST_ENCODE
         extra = ["--download-sections", f"*{seconds_arg(start)}-{end_arg}",
-                 "--force-keyframes-at-cuts"]
+                 "--force-keyframes-at-cuts", "--downloader-args", f"ffmpeg:{ffmpeg_args}"]
     args = [
         *QUALITIES[quality][1], *extra,
         "-P", folder,
@@ -342,7 +375,7 @@ def classify(line):
             "network is unreachable", "winerror 10060", "winerror 11001", "winerror 10054",
             "unable to connect")):
         return "network"
-    if "http error 403" in low:
+    if "http error 403" in low or "403 forbidden" in low or "server returned 403" in low:
         return "forbidden"
     return "other"
 
@@ -449,7 +482,7 @@ def main():
     nightly_tried = False
     for url in urls:
         ytdlp_args = build_args(url, folder, quality, whole_playlist, ffmpeg, deno, section)
-        rc, lines = run_ytdlp(ytdlp_args)
+        rc, lines = run_ytdlp(ytdlp_args, section)
         errors = [line for line in lines if line.startswith("ERROR:")]
 
         if rc != 0 and errors:
@@ -458,7 +491,7 @@ def main():
                 nightly_tried = True
                 print("\nСкачать не вышло, пробую ещё раз со свежим yt-dlp...\n")
                 if switch_to_nightly_ytdlp():
-                    rc, lines = run_ytdlp(ytdlp_args)  # готовые файлы yt-dlp пропустит
+                    rc, lines = run_ytdlp(ytdlp_args, section)  # готовые файлы yt-dlp пропустит
                     errors = [line for line in lines if line.startswith("ERROR:")]
 
         if rc != 0:

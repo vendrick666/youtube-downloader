@@ -73,6 +73,18 @@ QUALITIES = [
 
 PROGRESS_TEMPLATE = ("download:PROG %(progress.downloaded_bytes)s %(progress.total_bytes)s "
                      "%(progress.total_bytes_estimate)s %(progress.speed)s %(progress.eta)s")
+# Фрагменты вырезает FFmpeg. yt-dlp запускает его с -loglevel quiet, и тогда ни прогресса,
+# ни текста ошибки не видно - возвращаем и то и другое.
+FFMPEG_REPORT_ARGS = "-loglevel error -progress pipe:2 -nostats"
+# Точная обрезка = перекодирование. Кодек FFmpeg берёт по контейнеру (для MP4 - H.264),
+# но по умолчанию кодирует медленным пресетом, и 4K/AV1-фрагмент может перекодироваться
+# очень долго; veryfast в разы быстрее почти без потерь. Опции, которые кодеку не подходят,
+# FFmpeg просто пропускает.
+FFMPEG_FAST_ENCODE = "-preset veryfast -crf 18 -b:v 0 -pix_fmt yuv420p"
+FFMPEG_PROGRESS_LINE = re.compile(
+    r"^(?:out_time(?:_us|_ms)?|speed|progress|frame|fps|bitrate|total_size"
+    r"|dup_frames|drop_frames|stream_\d+_\d+_q)=")
+
 URL_RE = re.compile(r"https?://\S+")
 YOUTUBE_RE = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/\S+")
 
@@ -227,7 +239,7 @@ def classify(line):
             "network is unreachable", "winerror 10060", "winerror 11001", "winerror 10054",
             "unable to connect")):
         return "network"
-    if "http error 403" in low:
+    if "http error 403" in low or "403 forbidden" in low or "server returned 403" in low:
         return "forbidden"
     return "other"
 
@@ -309,8 +321,9 @@ class Tools:
         self.ready = False
 
     def prepare(self, status, progress):
+        """Программа пользуется только своими копиями инструментов в BIN_DIR:
+        чужие сборки FFmpeg (из PATH, от spotDL) бывают старыми или без нужных кодеков."""
         BIN_DIR.mkdir(parents=True, exist_ok=True)
-        spotdl_dir = Path.home() / ".spotdl"
 
         # --- yt-dlp
         managed = BIN_DIR / f"yt-dlp{EXE}"
@@ -332,8 +345,7 @@ class Tools:
                 touch(UPDATE_STAMP)
 
         # --- Deno: без него yt-dlp не проходит JS-проверку YouTube
-        self.deno = first_existing(os.environ.get("YTDL_DENO"), BIN_DIR / f"deno{EXE}",
-                                   spotdl_dir / f"deno{EXE}", shutil.which("deno"))
+        self.deno = first_existing(os.environ.get("YTDL_DENO"), BIN_DIR / f"deno{EXE}")
         if not self.deno and IS_WIN:
             archive = BIN_DIR / "deno.zip"
             status("Скачиваю Deno (один раз)...")
@@ -341,10 +353,12 @@ class Tools:
             extract_from_zip(archive, {"deno.exe"}, BIN_DIR)
             archive.unlink(missing_ok=True)
             self.deno = str(BIN_DIR / "deno.exe")
+        if not self.deno:
+            self.deno = shutil.which("deno")  # не Windows: системный
 
-        # --- FFmpeg: склеивает видео со звуком и делает MP3
-        self.ffmpeg = first_existing(os.environ.get("YTDL_FFMPEG"), BIN_DIR / f"ffmpeg{EXE}",
-                                     shutil.which("ffmpeg"), spotdl_dir / f"ffmpeg{EXE}")
+        # --- FFmpeg: склеивает видео со звуком, вырезает фрагменты и делает MP3.
+        # Берём полную сборку от авторов yt-dlp: в ней есть AV1/VP9 и libx264.
+        self.ffmpeg = first_existing(os.environ.get("YTDL_FFMPEG"), BIN_DIR / f"ffmpeg{EXE}")
         if not self.ffmpeg and IS_WIN:
             archive = BIN_DIR / "ffmpeg.zip"
             status("Скачиваю FFmpeg (один раз, ~200 МБ)...")
@@ -354,6 +368,8 @@ class Tools:
             extract_from_zip(archive, {"ffmpeg.exe", "ffprobe.exe"}, BIN_DIR)
             archive.unlink(missing_ok=True)
             self.ffmpeg = str(BIN_DIR / "ffmpeg.exe")
+        if not self.ffmpeg:
+            self.ffmpeg = shutil.which("ffmpeg")  # не Windows: системный
 
         self.ready = True
 
@@ -402,6 +418,8 @@ class Job:
         self.errors = []
         self.log_lines = []
         self.started = time.time()
+        self.duration = None  # длительность текущего видео, нужна для фрагмента "до конца"
+        self.ffmpeg_speed = None
 
     def build_cmd(self, url):
         playlist_mode = is_playlist_page(url) or (self.whole_playlist and has_playlist_param(url))
@@ -414,8 +432,12 @@ class Job:
             template = template[:-len(".%(ext)s")] + suffix + ".%(ext)s"
             end_arg = seconds_arg(end) if end is not None else "inf"
             extra = ["--download-sections", f"*{seconds_arg(start)}-{end_arg}"]
+            ffmpeg_args = FFMPEG_REPORT_ARGS
             if self.exact_cut:
                 extra.append("--force-keyframes-at-cuts")
+                if "-x" not in QUALITIES[self.quality][1]:  # видео, а не "только звук"
+                    ffmpeg_args += " " + FFMPEG_FAST_ENCODE
+            extra += ["--downloader-args", f"ffmpeg:{ffmpeg_args}"]
         cmd = [
             self.tools.ytdlp, *QUALITIES[self.quality][1], *extra,
             "-P", self.folder,
@@ -423,6 +445,7 @@ class Job:
             "--yes-playlist" if playlist_mode else "--no-playlist",
             "-N", "4", "--no-mtime", "--encoding", "utf-8",
             "--quiet", "--progress", "--newline", "--progress-template", PROGRESS_TEMPLATE,
+            "--print", "before_dl:DUR %(duration)s",
             "--print", "before_dl:ITEM %(playlist_index)s/%(n_entries)s %(title)s",
             "--print", "after_move:FILE %(filepath)s",
         ]
@@ -443,6 +466,7 @@ class Job:
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, env=env, creationflags=NO_WINDOW)
         errors = []
+        plain = []  # прочие строки - в основном сообщения FFmpeg
         for raw in self.proc.stdout:
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if not line:
@@ -450,8 +474,16 @@ class Job:
             if line.startswith("PROG "):
                 self.on_progress(line.split())
                 continue
+            if FFMPEG_PROGRESS_LINE.match(line):
+                self.on_ffmpeg_progress(line)
+                continue
             self.log_lines.append(line)
-            if line.startswith("ITEM "):
+            if line.startswith("DUR "):
+                try:
+                    self.duration = float(line[4:])
+                except ValueError:
+                    self.duration = None
+            elif line.startswith("ITEM "):
                 self.on_item(line[5:])
             elif line.startswith("FILE "):
                 path = line[5:].strip()
@@ -463,8 +495,12 @@ class Job:
             elif line.startswith("WARNING:"):
                 self.emit("log", line, "warn")
             else:
+                plain.append(line)
                 self.emit("log", line, "")
         self.proc.wait()
+        if plain and any("ffmpeg" in e.lower() for e in errors):
+            # "ffmpeg exited with code 1" ничего не объясняет - добавляем, что сказал сам FFmpeg
+            errors += [f"FFmpeg: {line}" for line in plain[-3:]]
         return self.proc.returncode, errors
 
     def on_item(self, rest):
@@ -475,9 +511,42 @@ class Job:
             self.emit("status", f"{action} ({index} из {total}): {title}")
         else:
             self.emit("status", f"{action}: {title}")
-        # при вырезании фрагмента yt-dlp сообщает прогресс только в самом конце
+        self.ffmpeg_speed = None
+        # для фрагмента прогресс начнёт приходить от FFmpeg, когда он найдёт нужное место
         self.emit("progress", None if self.section else 0.0)
-        self.emit("detail", "Это может занять пару минут" if self.section else "")
+        self.emit("detail", "Подключаюсь и ищу нужное место в видео..." if self.section else "")
+
+    def on_ffmpeg_progress(self, line):
+        key, _, value = line.partition("=")
+        if key == "speed":
+            try:
+                self.ffmpeg_speed = float(value.strip().rstrip("x"))
+            except ValueError:
+                self.ffmpeg_speed = None
+            return
+        if key != "out_time_us":
+            return
+        try:
+            done = int(value) / 1_000_000
+        except ValueError:
+            return
+        if done < 0:
+            return
+        start, end = self.section or (0.0, None)
+        if end is not None:
+            total = end - start
+        else:
+            total = self.duration - start if self.duration else None
+        fraction = min(done / total, 1.0) if total and total > 0 else None
+        details = f"Готово {format_timecode(done)}"
+        if total:
+            details += f" из {format_timecode(total)}"
+        if self.ffmpeg_speed:
+            details += f"  •  скорость {self.ffmpeg_speed:.1f}x"
+            if total:
+                details += f"  •  осталось ~{human_eta(max(total - done, 0) / self.ffmpeg_speed)}"
+        self.emit("progress", fraction)
+        self.emit("detail", details)
 
     def on_progress(self, parts):
         def num(value):
